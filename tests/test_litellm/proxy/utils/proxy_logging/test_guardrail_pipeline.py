@@ -4,7 +4,7 @@ Covers ``_should_use_guardrail_load_balancing``, ``_execute_guardrail_hook``,
 ``_execute_guardrail_with_load_balancing``, ``_process_guardrail_callback``,
 ``_process_prompt_template``, ``_process_guardrail_metadata``,
 ``_maybe_execute_pipelines``, ``_handle_pipeline_result``,
-``_run_guardrail_task_with_enrichment``.
+``_run_guardrail_with_metrics``, ``_emit_guardrail_metrics``.
 """
 
 from __future__ import annotations
@@ -17,12 +17,18 @@ import pytest
 from fastapi import HTTPException
 
 import litellm
+from litellm.exceptions import SensitiveDataRouteException
 from litellm.integrations.custom_guardrail import (
     CustomGuardrail,
     ModifyResponseException,
 )
+from litellm.integrations.prometheus import PrometheusLogger
 from litellm.proxy.utils import ProxyLogging
 from litellm.types.guardrails import GuardrailEventHooks
+from litellm.types.proxy.policy_engine.pipeline_types import (
+    GuardrailPipeline,
+    PipelineStep,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -348,6 +354,45 @@ async def test_maybe_execute_pipelines_skips_pipelines_with_other_mode(proxy_log
     assert out is data
 
 
+@pytest.mark.parametrize(
+    ("policy_state_key", "caller_metadata_key", "call_type"),
+    [
+        ("litellm_metadata", "metadata", "anthropic_messages"),
+        ("metadata", "litellm_metadata", "completion"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_maybe_execute_pipelines_finds_policy_state_when_caller_sends_own_metadata(
+    proxy_logging, make_user_api_key_auth, monkeypatch, policy_state_key, caller_metadata_key, call_type
+):
+    """The route picks the bucket the policy engine writes to (``litellm_metadata`` on
+    /v1/messages, ``metadata`` on chat completions), and the caller can populate the other
+    one, e.g. Claude Code sending ``metadata.user_id``. The pipeline must still run and block."""
+
+    class BlockingGuardrail(CustomGuardrail):
+        async def async_pre_call_hook(self, user_api_key_dict, cache, data, call_type):
+            raise HTTPException(status_code=400, detail={"error": "blocked by pipeline"})
+
+    monkeypatch.setattr(litellm, "callbacks", [BlockingGuardrail(guardrail_name="gr-1")])
+    pipeline = GuardrailPipeline(mode="pre_call", steps=[PipelineStep(guardrail="gr-1", on_fail="block")])
+    data = {
+        caller_metadata_key: {"user_id": "user_abc"},
+        policy_state_key: {"_guardrail_pipelines": [("policy-1", pipeline)]},
+        "messages": [],
+        "model": "m",
+    }
+
+    with pytest.raises(HTTPException) as exc_info:
+        await proxy_logging._maybe_execute_pipelines(
+            data=data,
+            user_api_key_dict=make_user_api_key_auth(),
+            call_type=call_type,
+            event_hook="pre_call",
+        )
+    assert exc_info.value.detail["error"] == "blocked by pipeline"
+    assert exc_info.value.detail["guardrail_name"] == "gr-1"
+
+
 @pytest.mark.asyncio
 async def test_maybe_execute_pipelines_blocks_on_block_terminal_action_raises(
     proxy_logging, make_user_api_key_auth, monkeypatch
@@ -358,6 +403,7 @@ async def test_maybe_execute_pipelines_blocks_on_block_terminal_action_raises(
     fake_result = MagicMock()
     fake_result.terminal_action = "block"
     fake_result.step_results = []
+    fake_result.original_exception = None
     data = {"metadata": {"_guardrail_pipelines": [("policy-1", pipeline)]}, "messages": [], "model": "m"}
 
     async def fake_execute_steps(**kwargs):
@@ -376,6 +422,42 @@ async def test_maybe_execute_pipelines_blocks_on_block_terminal_action_raises(
         )
 
 
+@pytest.mark.asyncio
+async def test_maybe_execute_pipelines_reraises_original_guardrail_exception(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    """A policy-wrapped guardrail block must surface the guardrail's own
+    exception verbatim, identical to the direct-attachment path."""
+    pipeline = MagicMock()
+    pipeline.mode = "pre_call"
+    pipeline.steps = []
+    original = HTTPException(
+        status_code=400,
+        detail={"error": "Violated OpenAI moderation policy", "moderation_result": {"x": 1}},
+    )
+    fake_result = MagicMock()
+    fake_result.terminal_action = "block"
+    fake_result.step_results = []
+    fake_result.original_exception = original
+    data = {"metadata": {"_guardrail_pipelines": [("policy-1", pipeline)]}, "messages": [], "model": "m"}
+
+    async def fake_execute_steps(**kwargs):
+        return fake_result
+
+    monkeypatch.setattr(
+        "litellm.proxy.policy_engine.pipeline_executor.PipelineExecutor.execute_steps",
+        fake_execute_steps,
+    )
+    with pytest.raises(HTTPException) as info:
+        await proxy_logging._maybe_execute_pipelines(
+            data=data,
+            user_api_key_dict=make_user_api_key_auth(),
+            call_type="completion",
+            event_hook="pre_call",
+        )
+    assert info.value is original
+
+
 # ---------------------------------------------------------------------------
 # _handle_pipeline_result
 # ---------------------------------------------------------------------------
@@ -390,10 +472,11 @@ def test_handle_pipeline_result_allow_with_modifications():
     assert out == {"a": 1, "b": 2, "c": 3}
 
 
-def test_handle_pipeline_result_block_raises_http_exception():
+def test_handle_pipeline_result_block_falls_back_to_generic_when_no_exception():
     result = MagicMock()
     result.terminal_action = "block"
     result.step_results = []
+    result.original_exception = None
     with pytest.raises(HTTPException) as info:
         ProxyLogging._handle_pipeline_result(result=result, data={"model": "m"}, policy_name="p")
     detail = info.value.detail
@@ -407,6 +490,94 @@ def test_handle_pipeline_result_block_raises_http_exception():
         "error_type": "guardrail_pipeline_error",
         "policy": "p",
     }
+
+
+def test_handle_pipeline_result_block_reraises_original_guardrail_exception():
+    """The policy path must re-raise the guardrail's own exception untouched,
+    not wrap it in a generic ``guardrail_pipeline_error``; this is what makes
+    the response and trace span identical to the direct-attachment path."""
+    original = HTTPException(
+        status_code=400,
+        detail={
+            "error": "Violated OpenAI moderation policy",
+            "moderation_result": {"violated_categories": ["harassment"]},
+        },
+    )
+    result = MagicMock()
+    result.terminal_action = "block"
+    result.step_results = []
+    result.original_exception = original
+    with pytest.raises(HTTPException) as info:
+        ProxyLogging._handle_pipeline_result(result=result, data={"model": "m"}, policy_name="p")
+    assert info.value is original
+    assert info.value.detail == {
+        "error": "Violated OpenAI moderation policy",
+        "moderation_result": {"violated_categories": ["harassment"]},
+    }
+
+
+def test_handle_pipeline_result_block_enriches_with_guardrail_name_and_mode():
+    """The re-raised exception must gain the blocking guardrail's name and mode,
+    matching the enrichment the direct-attachment path applies."""
+    cb = _make_guardrail()  # guardrail_name="g", event_hook=pre_call
+    original = HTTPException(status_code=400, detail={"error": "blocked"})
+    result = MagicMock()
+    result.terminal_action = "block"
+    result.step_results = [MagicMock(guardrail_name="g")]
+    result.original_exception = original
+
+    saved = litellm.callbacks
+    litellm.callbacks = [cb]
+    try:
+        with pytest.raises(HTTPException) as info:
+            ProxyLogging._handle_pipeline_result(
+                result=result, data={"model": "m"}, policy_name="p"
+            )
+    finally:
+        litellm.callbacks = saved
+
+    assert info.value is original
+    assert info.value.detail["guardrail_name"] == "g"
+    assert info.value.detail["guardrail_mode"] == GuardrailEventHooks.pre_call
+
+
+def test_handle_pipeline_result_block_does_not_reraise_sensitive_data_route():
+    """A step configured to block must enforce the block even when the guardrail
+    raised a reroute exception; re-raising it verbatim would route the request to
+    an alternate model instead of blocking, bypassing the configured policy."""
+    original = SensitiveDataRouteException(
+        route_to_model="on-prem-model",
+        session_id="sess-1",
+        guardrail_name="pii-router",
+    )
+    result = MagicMock()
+    result.terminal_action = "block"
+    result.step_results = [MagicMock(guardrail_name="pii-router")]
+    result.original_exception = original
+    with pytest.raises(HTTPException) as info:
+        ProxyLogging._handle_pipeline_result(result=result, data={"model": "m"}, policy_name="p")
+    assert info.value.status_code == 400
+    assert info.value.detail["error"]["type"] == "guardrail_pipeline_error"
+
+
+def test_handle_pipeline_result_block_does_not_reraise_modify_response():
+    """A step configured to block must enforce the block even when the guardrail
+    raised a passthrough/modify-response exception; re-raising it verbatim would
+    return the guardrail's synthetic response instead of blocking."""
+    original = ModifyResponseException(
+        message="redacted",
+        model="m",
+        request_data={"model": "m"},
+        guardrail_name="masker",
+    )
+    result = MagicMock()
+    result.terminal_action = "block"
+    result.step_results = [MagicMock(guardrail_name="masker")]
+    result.original_exception = original
+    with pytest.raises(HTTPException) as info:
+        ProxyLogging._handle_pipeline_result(result=result, data={"model": "m"}, policy_name="p")
+    assert info.value.status_code == 400
+    assert info.value.detail["error"]["type"] == "guardrail_pipeline_error"
 
 
 def test_handle_pipeline_result_modify_response_raises_modify_exception():
@@ -425,23 +596,42 @@ def test_handle_pipeline_result_unknown_action_returns_data():
 
 
 # ---------------------------------------------------------------------------
-# _run_guardrail_task_with_enrichment
+# _run_guardrail_with_metrics
 # ---------------------------------------------------------------------------
 
 
+def _prometheus_callback() -> MagicMock:
+    """Stand-in PrometheusLogger that records ``_record_guardrail_metrics`` calls.
+
+    ``MagicMock(spec=PrometheusLogger)`` passes the ``isinstance`` check inside
+    ``_emit_guardrail_metrics`` while letting us capture the recorded labels.
+    """
+    return MagicMock(spec=PrometheusLogger)
+
+
 @pytest.mark.asyncio
-async def test_run_guardrail_task_with_enrichment_passes_result():
+async def test_run_guardrail_with_metrics_passes_result_and_records_success(monkeypatch):
     async def task():
         return {"a": 1, "b": 2, "c": 3}
 
-    out = await ProxyLogging._run_guardrail_task_with_enrichment(
-        callback=MagicMock(guardrail_name="g"), coro=task()
+    prom = _prometheus_callback()
+    monkeypatch.setattr(litellm, "callbacks", [prom])
+
+    out = await ProxyLogging._run_guardrail_with_metrics(
+        callback=MagicMock(guardrail_name="g"), coro=task(), hook_type="during_call"
     )
+
     assert out == {"a": 1, "b": 2, "c": 3}
+    recorded = prom._record_guardrail_metrics.call_args.kwargs
+    assert recorded["guardrail_name"] == "g"
+    assert recorded["status"] == "success"
+    assert recorded["error_type"] is None
+    assert recorded["hook_type"] == "during_call"
+    assert recorded["latency_seconds"] >= 0
 
 
 @pytest.mark.asyncio
-async def test_run_guardrail_task_with_enrichment_enriches_http_exception_raises():
+async def test_run_guardrail_with_metrics_records_error_and_enriches(monkeypatch):
     detail = {"error": "blocked"}
 
     async def task():
@@ -450,9 +640,80 @@ async def test_run_guardrail_task_with_enrichment_enriches_http_exception_raises
     cb = MagicMock()
     cb.guardrail_name = "presidio"
     cb.event_hook = "pre_call"
+    prom = _prometheus_callback()
+    monkeypatch.setattr(litellm, "callbacks", [prom])
+
     with pytest.raises(HTTPException):
-        await ProxyLogging._run_guardrail_task_with_enrichment(callback=cb, coro=task())
+        await ProxyLogging._run_guardrail_with_metrics(
+            callback=cb, coro=task(), hook_type="post_call"
+        )
+
     assert detail["guardrail_name"] == "presidio"
+    recorded = prom._record_guardrail_metrics.call_args.kwargs
+    assert recorded["status"] == "error"
+    assert recorded["error_type"] == "HTTPException"
+    assert recorded["hook_type"] == "post_call"
+
+
+# ---------------------------------------------------------------------------
+# during_call / post_call phases emit the latency metric (LIT-3999 regression)
+# ---------------------------------------------------------------------------
+
+
+def _moderation_guardrail() -> MagicMock:
+    cb = MagicMock(spec=CustomGuardrail)
+    cb.__class__ = CustomGuardrail
+    cb.guardrail_name = "g"
+    cb.event_hook = GuardrailEventHooks.during_call
+    cb.use_native_during_call_hook = False
+    cb.should_run_guardrail = MagicMock(return_value=True)
+    cb.async_moderation_hook = AsyncMock(return_value=None)
+    cb.async_post_call_success_hook = AsyncMock(return_value=None)
+    cb.run_in_parallel = False
+    return cb
+
+
+@pytest.mark.asyncio
+async def test_during_call_hook_records_latency_metric(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    cb = _moderation_guardrail()
+    prom = _prometheus_callback()
+    monkeypatch.setattr(litellm, "callbacks", [prom, cb])
+
+    await proxy_logging.during_call_hook(
+        data={"model": "m"},
+        user_api_key_dict=make_user_api_key_auth(),
+        call_type="completion",
+    )
+
+    cb.async_moderation_hook.assert_awaited_once()
+    recorded = prom._record_guardrail_metrics.call_args.kwargs
+    assert recorded["hook_type"] == "during_call"
+    assert recorded["guardrail_name"] == "g"
+    assert recorded["status"] == "success"
+
+
+@pytest.mark.asyncio
+async def test_post_call_success_hook_records_latency_metric(
+    proxy_logging, make_user_api_key_auth, monkeypatch
+):
+    cb = _moderation_guardrail()
+    prom = _prometheus_callback()
+    monkeypatch.setattr(litellm, "callbacks", [prom, cb])
+    monkeypatch.setattr("litellm.proxy.proxy_server.llm_router", None, raising=False)
+
+    await proxy_logging.post_call_success_hook(
+        data={"model": "m"},
+        response=litellm.ModelResponse(),
+        user_api_key_dict=make_user_api_key_auth(),
+    )
+
+    cb.async_post_call_success_hook.assert_awaited_once()
+    recorded = prom._record_guardrail_metrics.call_args.kwargs
+    assert recorded["hook_type"] == "post_call"
+    assert recorded["guardrail_name"] == "g"
+    assert recorded["status"] == "success"
 
 
 # ---------------------------------------------------------------------------
@@ -557,3 +818,50 @@ async def test_process_prompt_template_async_get_prompt_error_raises(proxy_loggi
             prompt_version=None,
             call_type="completion",
         )
+
+
+@pytest.mark.asyncio
+async def test_process_prompt_template_aresponses_swaps_model_and_merges_input(proxy_logging, monkeypatch):
+    from litellm.proxy.prompts import prompt_registry
+
+    custom_logger = MagicMock()
+    prompt_spec = MagicMock()
+    prompt_spec.litellm_params = MagicMock(prompt_id="resolved-id")
+    monkeypatch.setattr(
+        prompt_registry.IN_MEMORY_PROMPT_REGISTRY,
+        "get_prompt_callback_by_id",
+        lambda *a, **kw: custom_logger,
+    )
+    monkeypatch.setattr(
+        prompt_registry.IN_MEMORY_PROMPT_REGISTRY, "get_prompt_by_id", lambda *a, **kw: prompt_spec
+    )
+
+    logging_obj = MagicMock()
+    logging_obj.async_get_chat_completion_prompt = AsyncMock(
+        return_value=(
+            "gpt-4o-mini",
+            [
+                {"role": "user", "content": "You are a pirate."},
+                {"role": "user", "content": "Who are you?"},
+            ],
+            {},
+        )
+    )
+    data: dict[str, object] = {"input": "Who are you?", "model": "anthropic-haiku-4-5", "prompt_id": "x"}
+    await proxy_logging._process_prompt_template(
+        data=data,
+        litellm_logging_obj=logging_obj,
+        prompt_id="x",
+        prompt_version=None,
+        call_type="aresponses",
+    )
+    assert data["model"] == "gpt-4o-mini"
+    assert data["input"] == [
+        {"role": "user", "content": "You are a pirate."},
+        {"role": "user", "content": "Who are you?"},
+    ]
+    assert "messages" not in data
+    assert "prompt_id" not in data
+    hook_kwargs = logging_obj.async_get_chat_completion_prompt.await_args.kwargs
+    assert hook_kwargs["messages"] == [{"role": "user", "content": "Who are you?"}]
+    assert hook_kwargs["prompt_spec"] is prompt_spec

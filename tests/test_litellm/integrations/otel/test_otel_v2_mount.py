@@ -4,12 +4,9 @@
 surface and the server-span + shared-provider behavior it produces.
 """
 
-import os
-import sys
 
 import pytest
 
-sys.path.insert(0, os.path.abspath("../../../.."))
 
 pytest.importorskip("opentelemetry")
 pytest.importorskip("opentelemetry.instrumentation.fastapi")
@@ -33,6 +30,13 @@ from litellm.integrations.otel.mount import (  # noqa: E402
     _passthrough_span_name_hook,
     instrument_fastapi_app,
 )
+
+
+@pytest.fixture(autouse=True)
+def _clear_otel_v2_flag_cache():
+    is_otel_v2_enabled.cache_clear()
+    yield
+    is_otel_v2_enabled.cache_clear()
 
 
 class _FakeSpan:
@@ -70,8 +74,10 @@ def _instrumented_app():
 def test_gate_toggles_with_env(monkeypatch):
     """The startup mount is guarded by this flag."""
     monkeypatch.delenv("LITELLM_OTEL_V2", raising=False)
+    is_otel_v2_enabled.cache_clear()
     assert is_otel_v2_enabled() is False
     monkeypatch.setenv("LITELLM_OTEL_V2", "1")
+    is_otel_v2_enabled.cache_clear()
     assert is_otel_v2_enabled() is True
 
 

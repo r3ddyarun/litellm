@@ -15,14 +15,11 @@ Streaming: CSW.__anext__ stores args on logging_obj at stream end.
 """
 
 import asyncio
-import os
-import sys
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-sys.path.insert(0, os.path.abspath("../../../.."))
 
 import litellm
 from litellm.caching.caching import DualCache
@@ -152,6 +149,59 @@ class TestHasPostCallGuardrails:
 
         with patch("litellm.callbacks", [ListGuardrail()]):
             assert ProxyBaseLLMRequestProcessing._has_post_call_guardrails() is False
+
+
+class TestHasPostCallGuardrailsForPassthrough:
+    """Passthrough buffering must include event_hook=None guardrails.
+
+    Those guardrails run at post_call (should_run_guardrail treats None as
+    matching every hook); skipping the buffer would forward the raw upstream
+    body and bypass output processing. The check is scoped to the request via
+    should_run_guardrail so a guardrail that exists globally but is not
+    configured for this key/team does not turn the stream non-streaming.
+    """
+
+    @staticmethod
+    def _has(data: dict) -> bool:
+        return ProxyBaseLLMRequestProcessing(
+            data=data
+        )._has_post_call_guardrails_for_passthrough()
+
+    def test_returns_true_for_event_hook_none(self):
+        with patch("litellm.callbacks", [AllEventsGuardrail()]):
+            assert self._has({}) is True
+
+    def test_returns_true_for_post_call_guardrail(self):
+        with patch("litellm.callbacks", [PostCallGuardrail()]):
+            assert self._has({}) is True
+
+    def test_returns_false_for_pre_call_only(self):
+        with patch("litellm.callbacks", [PreCallGuardrail()]):
+            assert self._has({}) is False
+
+    def test_returns_false_for_no_callbacks(self):
+        with patch("litellm.callbacks", []):
+            assert self._has({}) is False
+
+    def test_ignores_non_guardrail_callbacks(self):
+        with patch("litellm.callbacks", ["langfuse", CustomLogger()]):
+            assert self._has({}) is False
+
+    def test_request_scoped_guardrail_not_configured_for_key(self):
+        """A non-default-on post_call guardrail must not force buffering for a
+        request whose key/team does not reference it."""
+
+        class OptInPostCall(CustomGuardrail):
+            def __init__(self):
+                super().__init__(
+                    guardrail_name="opt-in-post",
+                    default_on=False,
+                    event_hook=GuardrailEventHooks.post_call,
+                )
+
+        with patch("litellm.callbacks", [OptInPostCall()]):
+            assert self._has({"metadata": {"guardrails": []}}) is False
+            assert self._has({"metadata": {"guardrails": ["opt-in-post"]}}) is True
 
 
 # ---------------------------------------------------------------------------
@@ -333,25 +383,30 @@ def test_flush_deferred_async_logging_noop_when_no_closure_stored():
 
 def test_proxy_finally_block_routes_through_flush_helper():
     """
-    Source-level contract: the proxy's `base_process_llm_request` finally
-    block must delegate to `_flush_deferred_async_logging` rather than
-    inlining the gating logic. Inlining is what allowed the duplicate
-    Success+Failure spend log to slip in originally — this guards the
-    refactor.
+    Source-level contract: the proxy's request-processing finally block must
+    delegate to `_flush_deferred_async_logging` rather than inlining the gating
+    logic. Inlining is what allowed the duplicate Success+Failure spend log to
+    slip in originally — this guards the refactor.
+
+    Both halves of the request path are inspected: `base_process_llm_request` is
+    the public entry point and `_process_llm_request` holds the body, so neither
+    may inline the reset regardless of which one carries the finally block.
     """
     import inspect
 
-    src = inspect.getsource(ProxyBaseLLMRequestProcessing.base_process_llm_request)
+    src = inspect.getsource(ProxyBaseLLMRequestProcessing._process_llm_request) + inspect.getsource(
+        ProxyBaseLLMRequestProcessing.base_process_llm_request
+    )
     assert "_flush_deferred_async_logging" in src, (
-        "base_process_llm_request must call _flush_deferred_async_logging "
-        "from its finally block — do not inline the gating logic."
+        "the request path must call _flush_deferred_async_logging from its "
+        "finally block — do not inline the gating logic."
     )
     # Belt-and-braces: the inlined `_enqueue_deferred_logging = None` reset
     # was the symptom of the duplicate-log bug; assert it stays inside the
     # helper, not in the request-processing function.
     assert "_enqueue_deferred_logging = None" not in src, (
         "Reset of _enqueue_deferred_logging must live inside "
-        "_flush_deferred_async_logging, not in base_process_llm_request."
+        "_flush_deferred_async_logging, not in the request path."
     )
 
 
@@ -567,7 +622,7 @@ class TestDeferredStreamingClosure:
         """If a guardrail raises HTTPException, the production
         _run_deferred_stream_guardrails must still fire logging
         and set guardrail_blocked in metadata."""
-        from fastapi import HTTPException  # noqa: local import for test isolation
+        from fastapi import HTTPException  # local import for test isolation
 
         logging_called = False
 
